@@ -1,0 +1,1730 @@
+'use client';
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+function SaveFilterPresetModal({
+  filters,
+  tags,
+  error,
+  onClose,
+  onSaved,
+}: {
+  filters: FilterState;
+  tags: Tag[];
+  error: string;
+  onClose: () => void;
+  onSaved: (preset: FilterPreset) => void;
+}) {
+  const [name, setName] = useState('');
+  const tagName = tags.find((t) => t.id === filters.tagId)?.name;
+  const preview = buildFilterPreview(filters, tagName);
+
+  function handleSave() {
+    if (!name.trim()) return;
+    onSaved({
+      id: crypto.randomUUID(),
+      name: name.trim(),
+      filters,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  return (
+    <Modal onClose={onClose} title="💾 Save Filter Preset">
+      <div className="space-y-3">
+        {error && (
+          <div className="rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3 text-sm text-red-700 dark:text-red-400">
+            {error}
+          </div>
+        )}
+        <div className="rounded-lg bg-gray-50 dark:bg-gray-700/50 px-3 py-2 text-sm text-gray-600 dark:text-gray-300">
+          <span className="font-medium">Active filters: </span>{preview}
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Preset name <span className="text-red-500">*</span>
+          </label>
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleSave()}
+            placeholder="e.g. Today's High Priority"
+            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+        <button
+          onClick={handleSave}
+          disabled={!name.trim()}
+          className="w-full rounded-lg bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white font-medium py-2.5"
+        >
+          Save
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+import { useRouter } from 'next/navigation';
+import type {
+  Todo,
+  Subtask,
+  Tag,
+  Template,
+  Priority,
+  RecurrencePattern,
+} from '@/lib/db';
+import {
+  applyFilters,
+  hasActiveFilters,
+  loadPresets,
+  savePreset,
+  deletePreset,
+  buildFilterPreview,
+  DEFAULT_FILTER_STATE,
+  type FilterState,
+  type FilterPreset,
+} from '@/lib/filters';
+import { useDebounce } from '@/lib/hooks/useDebounce';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface TodoDraft {
+  title: string;
+  priority: Priority;
+  due_date: string;
+  is_recurring: boolean;
+  recurrence_pattern: RecurrencePattern | null;
+  reminder_minutes: number | null;
+  tag_ids: number[];
+  subtasks: { title: string }[];
+}
+
+const PRIORITY_ORDER: Record<Priority, number> = { high: 0, medium: 1, low: 2 };
+const REMINDER_OPTIONS = [
+  { label: '15 min before', value: 15 },
+  { label: '30 min before', value: 30 },
+  { label: '1 hour before', value: 60 },
+  { label: '2 hours before', value: 120 },
+  { label: '1 day before', value: 1440 },
+  { label: '2 days before', value: 2880 },
+  { label: '1 week before', value: 10080 },
+];
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function sortTodos(todos: Todo[]): Todo[] {
+  return [...todos].sort((a, b) => {
+    if (PRIORITY_ORDER[a.priority] !== PRIORITY_ORDER[b.priority]) {
+      return PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority];
+    }
+    const aDue = a.due_date ? new Date(a.due_date).getTime() : Infinity;
+    const bDue = b.due_date ? new Date(b.due_date).getTime() : Infinity;
+    if (aDue !== bDue) return aDue - bDue;
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+  });
+}
+
+function sectionTodos(todos: Todo[], now: Date) {
+  const incomplete = todos.filter((t) => !t.completed);
+  const overdue = sortTodos(incomplete.filter((t) => t.due_date && new Date(t.due_date) < now));
+  const pending = sortTodos(incomplete.filter((t) => !t.due_date || new Date(t.due_date) >= now));
+  const completed = todos
+    .filter((t) => t.completed)
+    .sort(
+      (a, b) =>
+        new Date(b.updated_at ?? b.created_at).getTime() -
+        new Date(a.updated_at ?? a.created_at).getTime()
+    );
+  return { overdue, pending, completed };
+}
+
+function formatDueDate(iso: string): string {
+  return new Date(iso).toLocaleString('en-SG', { timeZone: 'Asia/Singapore' });
+}
+
+function formatReminder(minutes: number): string {
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1440) return `${minutes / 60}h`;
+  if (minutes < 10080) return `${minutes / 1440}d`;
+  return `${minutes / 10080}w`;
+}
+
+function priorityColor(p: Priority) {
+  return p === 'high'
+    ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+    : p === 'medium'
+    ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400'
+    : 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400';
+}
+
+function emptyDraft(): TodoDraft {
+  return {
+    title: '',
+    priority: 'medium',
+    due_date: '',
+    is_recurring: false,
+    recurrence_pattern: null,
+    reminder_minutes: null,
+    tag_ids: [],
+    subtasks: [],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Sub-components
+// ---------------------------------------------------------------------------
+
+function PriorityBadge({ priority }: { priority: Priority }) {
+  return (
+    <span className={`rounded px-2 py-0.5 text-xs font-medium ${priorityColor(priority)}`}>
+      {priority}
+    </span>
+  );
+}
+
+function Modal({
+  title,
+  onClose,
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') onClose();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      onClick={(e) => e.target === e.currentTarget && onClose()}
+    >
+      <div className="w-full max-w-lg rounded-2xl bg-white dark:bg-gray-800 shadow-xl max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between border-b border-gray-200 dark:border-gray-700 px-6 py-4">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">{title}</h2>
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 text-xl"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="p-6">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SaveTemplateModal
+// ---------------------------------------------------------------------------
+
+function SaveTemplateModal({
+  todoDraft,
+  onClose,
+  onSaved,
+}: {
+  todoDraft: TodoDraft;
+  onClose: () => void;
+  onSaved: (t: Template) => void;
+}) {
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [category, setCategory] = useState('');
+  const [offsetMinutes, setOffsetMinutes] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  async function handleSave() {
+    if (!name.trim()) { setError('Name is required'); return; }
+    setSaving(true);
+    setError('');
+    try {
+      const payload: Record<string, unknown> = {
+        name: name.trim(),
+        title_template: todoDraft.title,
+        priority: todoDraft.priority,
+        is_recurring: todoDraft.is_recurring,
+        recurrence_pattern: todoDraft.recurrence_pattern ?? undefined,
+        reminder_minutes: todoDraft.reminder_minutes ?? undefined,
+        subtasks: todoDraft.subtasks.map((s, i) => ({ title: s.title, position: i })),
+      };
+      if (description.trim()) payload.description = description.trim();
+      if (category.trim()) payload.category = category.trim();
+      if (offsetMinutes.trim()) payload.due_date_offset_minutes = Number(offsetMinutes);
+
+      const res = await fetch('/api/templates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setError(data.error ?? 'Failed to save template');
+        return;
+      }
+      onSaved(await res.json());
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal onClose={onClose} title="💾 Save as Template">
+      {error && (
+        <div className="mb-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 p-3 text-sm text-red-700 dark:text-red-400">
+          {error}
+        </div>
+      )}
+      <div className="space-y-3">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Template name <span className="text-red-500">*</span>
+          </label>
+          <input
+            autoFocus
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. Weekly Team Meeting"
+            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Description (optional)
+          </label>
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Optional description"
+            rows={2}
+            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+          />
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Category (optional)
+          </label>
+          <input
+            value={category}
+            onChange={(e) => setCategory(e.target.value)}
+            list="category-suggestions"
+            placeholder="e.g. Work, Personal, Finance"
+            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <datalist id="category-suggestions">
+            {['Work', 'Personal', 'Finance', 'Health', 'Education'].map((c) => (
+              <option key={c} value={c} />
+            ))}
+          </datalist>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+            Due date offset (minutes, optional)
+          </label>
+          <input
+            type="number"
+            value={offsetMinutes}
+            onChange={(e) => setOffsetMinutes(e.target.value)}
+            placeholder="e.g. 1440 = 1 day from now"
+            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+        <div className="pt-1 text-sm text-gray-500 dark:text-gray-400 space-y-0.5">
+          <div>Title: <span className="font-medium">{todoDraft.title}</span></div>
+          <div>Priority: <PriorityBadge priority={todoDraft.priority} /></div>
+          {todoDraft.subtasks.length > 0 && (
+            <div>{todoDraft.subtasks.length} subtask(s) will be saved</div>
+          )}
+        </div>
+        <button
+          onClick={handleSave}
+          disabled={!name.trim() || saving}
+          className="w-full rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-medium py-2.5 transition-colors"
+        >
+          {saving ? 'Saving…' : 'Save Template'}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// TemplateCard
+// ---------------------------------------------------------------------------
+
+function TemplateCard({
+  template,
+  onUse,
+  onDelete,
+}: {
+  template: Template;
+  onUse: (id: number) => void;
+  onDelete?: (id: number) => void;
+}) {
+  return (
+    <div className="rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-4">
+      <div className="flex items-start justify-between gap-2 mb-1">
+        <div className="flex items-center gap-2 flex-wrap">
+          <strong className="text-gray-900 dark:text-white">{template.name}</strong>
+          {template.category && (
+            <span className="rounded-full bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 px-2 py-0.5 text-xs">
+              {template.category}
+            </span>
+          )}
+        </div>
+      </div>
+      {template.description && (
+        <p className="text-sm text-gray-500 dark:text-gray-400 mb-2">{template.description}</p>
+      )}
+      <div className="flex flex-wrap gap-1.5 mb-3">
+        <PriorityBadge priority={template.priority} />
+        {template.is_recurring && (
+          <span className="rounded px-2 py-0.5 text-xs bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">
+            🔄 {template.recurrence_pattern}
+          </span>
+        )}
+        {template.reminder_minutes != null && (
+          <span className="rounded px-2 py-0.5 text-xs bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300">
+            🔔 {formatReminder(template.reminder_minutes)}
+          </span>
+        )}
+        {template.subtasks_json && (() => {
+          try {
+            const subs = JSON.parse(template.subtasks_json);
+            return subs.length > 0 ? (
+              <span className="rounded px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300">
+                {subs.length} subtask(s)
+              </span>
+            ) : null;
+          } catch { return null; }
+        })()}
+      </div>
+      <div className="flex gap-2">
+        <button
+          onClick={() => onUse(template.id)}
+          className="flex-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium py-1.5 transition-colors"
+        >
+          Use
+        </button>
+        {onDelete && (
+          <button
+            onClick={() => onDelete(template.id)}
+            className="rounded-lg bg-red-50 hover:bg-red-100 dark:bg-red-900/20 dark:hover:bg-red-900/40 text-red-600 dark:text-red-400 text-sm font-medium px-3 py-1.5 transition-colors"
+          >
+            Delete
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// TemplateManagerModal
+// ---------------------------------------------------------------------------
+
+function TemplateManagerModal({
+  templates,
+  onUse,
+  onDelete,
+  onClose,
+}: {
+  templates: Template[];
+  onUse: (id: number) => void;
+  onDelete: (id: number) => void;
+  onClose: () => void;
+}) {
+  return (
+    <Modal onClose={onClose} title="📋 Template Manager">
+      {templates.length === 0 ? (
+        <p className="text-center text-gray-500 dark:text-gray-400 py-8">
+          No templates yet. Save a todo as a template to get started.
+        </p>
+      ) : (
+        <div className="space-y-3 overflow-y-auto max-h-[60vh]">
+          {templates.map((t) => (
+            <TemplateCard
+              key={t.id}
+              template={t}
+              onUse={(id) => { onUse(id); onClose(); }}
+              onDelete={onDelete}
+            />
+          ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// EditTodoModal
+// ---------------------------------------------------------------------------
+
+function EditTodoModal({
+  todo,
+  tags,
+  onClose,
+  onSaved,
+}: {
+  todo: Todo;
+  tags: Tag[];
+  onClose: () => void;
+  onSaved: (t: Todo) => void;
+}) {
+  const [title, setTitle] = useState(todo.title);
+  const [priority, setPriority] = useState<Priority>(todo.priority);
+  const [dueDate, setDueDate] = useState(
+    todo.due_date ? new Date(todo.due_date).toISOString().slice(0, 16) : ''
+  );
+  const [isRecurring, setIsRecurring] = useState(todo.is_recurring);
+  const [recurrencePattern, setRecurrencePattern] = useState<RecurrencePattern | ''>(
+    todo.recurrence_pattern ?? ''
+  );
+  const [reminderMinutes, setReminderMinutes] = useState<number | ''>(
+    todo.reminder_minutes ?? ''
+  );
+  const [tagIds, setTagIds] = useState<number[]>((todo.tags ?? []).map((t) => t.id));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  function toggleTag(id: number) {
+    setTagIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+
+  async function handleSave() {
+    if (!title.trim()) { setError('Title is required'); return; }
+    setSaving(true);
+    setError('');
+    try {
+      const res = await fetch(`/api/todos/${todo.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: title.trim(),
+          priority,
+          due_date: dueDate || null,
+          is_recurring: isRecurring,
+          recurrence_pattern: isRecurring ? recurrencePattern || null : null,
+          reminder_minutes: reminderMinutes !== '' ? Number(reminderMinutes) : null,
+          tag_ids: tagIds,
+        }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        setError(data.error ?? 'Update failed');
+        return;
+      }
+      onSaved(await res.json());
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Modal onClose={onClose} title="Edit Todo">
+      {error && (
+        <div className="mb-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 p-3 text-sm text-red-700 dark:text-red-400">
+          {error}
+        </div>
+      )}
+      <div className="space-y-3">
+        <input
+          autoFocus
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+        />
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs text-gray-500 mb-1">Priority</label>
+            <select
+              value={priority}
+              onChange={(e) => setPriority(e.target.value as Priority)}
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white"
+            >
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500 mb-1">Due date</label>
+            <input
+              type="datetime-local"
+              value={dueDate}
+              onChange={(e) => setDueDate(e.target.value)}
+              className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white"
+            />
+          </div>
+        </div>
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={isRecurring}
+              onChange={(e) => setIsRecurring(e.target.checked)}
+              className="rounded"
+            />
+            <span className="text-sm text-gray-700 dark:text-gray-300">Recurring</span>
+          </label>
+          {isRecurring && (
+            <select
+              value={recurrencePattern}
+              onChange={(e) => setRecurrencePattern(e.target.value as RecurrencePattern)}
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm text-gray-900 dark:text-white"
+            >
+              <option value="">Select…</option>
+              <option value="daily">Daily</option>
+              <option value="weekly">Weekly</option>
+              <option value="monthly">Monthly</option>
+              <option value="yearly">Yearly</option>
+            </select>
+          )}
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Reminder</label>
+          <select
+            value={reminderMinutes}
+            onChange={(e) =>
+              setReminderMinutes(e.target.value === '' ? '' : Number(e.target.value))
+            }
+            className="w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white"
+          >
+            <option value="">No reminder</option>
+            {REMINDER_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        {tags.length > 0 && (
+          <div>
+            <label className="block text-xs text-gray-500 mb-1">Tags</label>
+            <div className="flex flex-wrap gap-1.5">
+              {tags.map((tag) => (
+                <button
+                  key={tag.id}
+                  onClick={() => toggleTag(tag.id)}
+                  style={{
+                    backgroundColor: tagIds.includes(tag.id) ? tag.color : undefined,
+                    color: tagIds.includes(tag.id) ? '#fff' : undefined,
+                    borderColor: tag.color,
+                  }}
+                  className="rounded-full border px-3 py-0.5 text-xs font-medium transition-colors"
+                >
+                  {tag.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="flex gap-3 pt-1">
+          <button
+            onClick={handleSave}
+            disabled={saving}
+            className="flex-1 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-medium py-2.5"
+          >
+            {saving ? 'Saving…' : 'Update'}
+          </button>
+          <button
+            onClick={onClose}
+            className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 font-medium py-2.5 hover:bg-gray-50 dark:hover:bg-gray-700"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ManageTagsModal
+// ---------------------------------------------------------------------------
+
+function ManageTagsModal({
+  tags,
+  onClose,
+  onCreated,
+  onDeleted,
+}: {
+  tags: Tag[];
+  onClose: () => void;
+  onCreated: (tag: Tag) => void;
+  onDeleted: (id: number) => void;
+}) {
+  const [newName, setNewName] = useState('');
+  const [newColor, setNewColor] = useState('#3B82F6');
+  const [error, setError] = useState('');
+
+  async function handleCreate() {
+    if (!newName.trim()) return;
+    setError('');
+    const res = await fetch('/api/tags', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newName.trim(), color: newColor }),
+    });
+    if (!res.ok) {
+      const data = await res.json();
+      setError(data.error ?? 'Failed to create tag');
+      return;
+    }
+    onCreated(await res.json());
+    setNewName('');
+  }
+
+  async function handleDelete(id: number) {
+    const res = await fetch(`/api/tags/${id}`, { method: 'DELETE' });
+    if (res.ok) onDeleted(id);
+  }
+
+  return (
+    <Modal onClose={onClose} title="🏷 Manage Tags">
+      <div className="space-y-4">
+        <div className="flex gap-2">
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="Tag name"
+            onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
+            className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+          <input
+            type="color"
+            value={newColor}
+            onChange={(e) => setNewColor(e.target.value)}
+            className="w-10 h-10 rounded cursor-pointer border border-gray-300"
+            title="Pick color"
+          />
+          <button
+            onClick={handleCreate}
+            disabled={!newName.trim()}
+            className="rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-medium px-4 py-2"
+          >
+            Create
+          </button>
+        </div>
+        {error && (
+          <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+        )}
+        <div className="space-y-2 max-h-60 overflow-y-auto">
+          {tags.map((tag) => (
+            <div key={tag.id} className="flex items-center justify-between rounded-lg border border-gray-200 dark:border-gray-700 px-3 py-2">
+              <div className="flex items-center gap-2">
+                <div className="w-4 h-4 rounded-full" style={{ backgroundColor: tag.color }} />
+                <span className="text-gray-900 dark:text-white">{tag.name}</span>
+              </div>
+              <button
+                onClick={() => handleDelete(tag.id)}
+                className="text-red-500 hover:text-red-700 text-sm"
+              >
+                Delete
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SubtaskList
+// ---------------------------------------------------------------------------
+
+function SubtaskList({
+  todoId,
+  subtasks,
+  onChanged,
+}: {
+  todoId: number;
+  subtasks: Subtask[];
+  onChanged: () => void;
+}) {
+  const [newTitle, setNewTitle] = useState('');
+  const [expanded, setExpanded] = useState(false);
+
+  const total = subtasks.length;
+  const done = subtasks.filter((s) => s.completed).length;
+
+  async function addSubtask() {
+    if (!newTitle.trim()) return;
+    await fetch(`/api/todos/${todoId}/subtasks`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: newTitle.trim() }),
+    });
+    setNewTitle('');
+    onChanged();
+  }
+
+  async function toggleSubtask(s: Subtask) {
+    await fetch(`/api/subtasks/${s.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ completed: !s.completed }),
+    });
+    onChanged();
+  }
+
+  async function deleteSubtask(id: number) {
+    await fetch(`/api/subtasks/${id}`, { method: 'DELETE' });
+    onChanged();
+  }
+
+  return (
+    <div className="mt-2">
+      {total > 0 && (
+        <div className="flex items-center gap-2 mb-1">
+          <div className="flex-1 bg-gray-200 dark:bg-gray-700 rounded-full h-1.5">
+            <div
+              className="bg-green-500 rounded-full h-1.5 transition-all"
+              style={{ width: `${total ? (done / total) * 100 : 0}%` }}
+            />
+          </div>
+          <span className="text-xs text-gray-500 dark:text-gray-400">
+            {done}/{total}
+          </span>
+        </div>
+      )}
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="text-xs text-blue-600 dark:text-blue-400 hover:underline"
+      >
+        {expanded ? '▼' : '▶'} Subtasks
+      </button>
+      {expanded && (
+        <div className="mt-2 space-y-1">
+          {subtasks.map((s) => (
+            <div key={s.id} className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={s.completed}
+                onChange={() => toggleSubtask(s)}
+                className="rounded"
+              />
+              <span
+                className={`flex-1 text-sm ${
+                  s.completed ? 'line-through text-gray-400' : 'text-gray-700 dark:text-gray-300'
+                }`}
+              >
+                {s.title}
+              </span>
+              <button
+                onClick={() => deleteSubtask(s.id)}
+                className="text-gray-400 hover:text-red-500 text-xs"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          <div className="flex gap-1 mt-1">
+            <input
+              value={newTitle}
+              onChange={(e) => setNewTitle(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && addSubtask()}
+              placeholder="Add subtask…"
+              className="flex-1 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+            />
+            <button
+              onClick={addSubtask}
+              disabled={!newTitle.trim()}
+              className="rounded bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-xs px-2 py-1"
+            >
+              Add
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// TodoItem
+// ---------------------------------------------------------------------------
+
+function TodoItem({
+  todo,
+  tags,
+  onToggle,
+  onEdit,
+  onDelete,
+  onChanged,
+}: {
+  todo: Todo;
+  tags: Tag[];
+  onToggle: (id: number, completed: boolean) => void;
+  onEdit: (todo: Todo) => void;
+  onDelete: (id: number) => void;
+  onChanged: () => void;
+}) {
+  const todoTags = (todo.tags ?? []).map((tt) => tags.find((g) => g.id === tt.id) ?? tt);
+
+  return (
+    <li className="rounded-xl bg-white dark:bg-gray-800 shadow-sm border border-gray-100 dark:border-gray-700 p-4">
+      <div className="flex items-start gap-3">
+        <input
+          type="checkbox"
+          checked={todo.completed}
+          onChange={(e) => onToggle(todo.id, e.target.checked)}
+          className="mt-1 h-4 w-4 rounded border-gray-300 dark:border-gray-600"
+          aria-label={`Mark "${todo.title}" as ${todo.completed ? 'incomplete' : 'complete'}`}
+        />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-start justify-between gap-2">
+            <p
+              className={`font-medium truncate ${
+                todo.completed
+                  ? 'line-through text-gray-400'
+                  : 'text-gray-900 dark:text-white'
+              }`}
+            >
+              {todo.title}
+            </p>
+            <div className="flex gap-1 shrink-0">
+              <PriorityBadge priority={todo.priority} />
+              {todo.is_recurring && (
+                <span className="rounded px-1.5 py-0.5 text-xs bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400">
+                  🔄
+                </span>
+              )}
+            </div>
+          </div>
+          {todo.due_date && (
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+              📅 {formatDueDate(todo.due_date)}
+              {todo.reminder_minutes != null && ` · 🔔 ${formatReminder(todo.reminder_minutes)}`}
+            </p>
+          )}
+          {todoTags.length > 0 && (
+            <div className="flex flex-wrap gap-1 mt-1">
+              {todoTags.map((tag) => (
+                <span
+                  key={tag.id}
+                  className="rounded-full px-2 py-0.5 text-xs text-white font-medium"
+                  style={{ backgroundColor: tag.color }}
+                >
+                  {tag.name}
+                </span>
+              ))}
+            </div>
+          )}
+          <SubtaskList
+            todoId={todo.id}
+            subtasks={todo.subtasks ?? []}
+            onChanged={onChanged}
+          />
+        </div>
+        <div className="flex gap-2 shrink-0 text-sm">
+          <button
+            onClick={() => onEdit(todo)}
+            className="text-blue-600 dark:text-blue-400 hover:underline"
+          >
+            Edit
+          </button>
+          <button
+            onClick={() => onDelete(todo.id)}
+            className="text-red-500 dark:text-red-400 hover:underline"
+          >
+            Delete
+          </button>
+        </div>
+      </div>
+    </li>
+  );
+}
+  export default function HomePage() {
+  const router = useRouter();
+  const [user, setUser] = useState<{ id: number; username: string } | null>(null);
+  const [todos, setTodos] = useState<Todo[]>([]);
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [templates, setTemplates] = useState<Template[]>([]);
+
+  // UI state
+  const [draft, setDraft] = useState<TodoDraft>(emptyDraft());
+  const [editingTodo, setEditingTodo] = useState<Todo | null>(null);
+  const [showSaveTemplate, setShowSaveTemplate] = useState(false);
+  const [showTemplateManager, setShowTemplateManager] = useState(false);
+  const [showManageTags, setShowManageTags] = useState(false);
+  const [showTemplateDropdown, setShowTemplateDropdown] = useState(false);
+  const [addError, setAddError] = useState('');
+  const [filters, setFilters] = useState<FilterState>(DEFAULT_FILTER_STATE);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [presets, setPresets] = useState<FilterPreset[]>([]);
+  const [showSavePreset, setShowSavePreset] = useState(false);
+  const [savePresetError, setSavePresetError] = useState('');
+  const debouncedSearch = useDebounce(filters.search, 300);
+
+  // Notification polling
+  const notifIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ---------------------------------------------------------------------------
+  // Fetch data
+  // ---------------------------------------------------------------------------
+
+  const fetchTodos = useCallback(async () => {
+    const res = await fetch('/api/todos');
+    if (res.ok) setTodos(await res.json());
+  }, []);
+
+  const fetchTags = useCallback(async () => {
+    const res = await fetch('/api/tags');
+    if (res.ok) setTags(await res.json());
+  }, []);
+
+  const fetchTemplates = useCallback(async () => {
+    const res = await fetch('/api/templates');
+    if (res.ok) setTemplates(await res.json());
+  }, []);
+
+  useEffect(() => {
+    fetch('/api/auth/me')
+      .then((res) => {
+        if (!res.ok) { router.replace('/login'); return null; }
+        return res.json();
+      })
+      .then((u) => {
+        if (u) {
+          setUser(u);
+          fetchTodos();
+          fetchTags();
+          fetchTemplates();
+        }
+      });
+  }, [router, fetchTodos, fetchTags, fetchTemplates]);
+
+  // Load saved filter presets from localStorage on mount
+  useEffect(() => {
+    setPresets(loadPresets());
+  }, []);
+
+  // Notification polling every 30 seconds
+  useEffect(() => {
+    async function checkNotifications() {
+      if (Notification.permission !== 'granted') return;
+      const res = await fetch('/api/notifications/check');
+      if (!res.ok) return;
+      const due: Array<{ id: number; title: string; due_date: string }> = await res.json();
+      for (const item of due) {
+        new Notification('Todo Reminder', {
+          body: `${item.title} is due at ${formatDueDate(item.due_date)}`,
+        });
+      }
+    }
+
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+
+    notifIntervalRef.current = setInterval(checkNotifications, 30_000);
+    return () => {
+      if (notifIntervalRef.current) clearInterval(notifIntervalRef.current);
+    };
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // CRUD handlers
+  // ---------------------------------------------------------------------------
+
+  async function handleAddTodo(e: React.FormEvent) {
+    e.preventDefault();
+    if (!draft.title.trim()) { setAddError('Title is required'); return; }
+    setAddError('');
+
+    const res = await fetch('/api/todos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: draft.title.trim(),
+        priority: draft.priority,
+        due_date: draft.due_date || null,
+        is_recurring: draft.is_recurring,
+        recurrence_pattern: draft.is_recurring ? draft.recurrence_pattern : null,
+        reminder_minutes: draft.reminder_minutes,
+        tag_ids: draft.tag_ids,
+      }),
+    });
+
+    if (!res.ok) {
+      const data = await res.json();
+      setAddError(data.error ?? 'Failed to add todo');
+      return;
+    }
+
+    const newTodo: Todo = await res.json();
+
+    // Add draft subtasks to the new todo
+    for (let i = 0; i < draft.subtasks.length; i++) {
+      const sub = draft.subtasks[i];
+      if (sub.title.trim()) {
+        await fetch(`/api/todos/${newTodo.id}/subtasks`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: sub.title.trim() }),
+        });
+      }
+    }
+
+    setDraft(emptyDraft());
+    fetchTodos();
+  }
+
+  async function handleToggle(id: number, completed: boolean) {
+    await fetch(`/api/todos/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ completed }),
+    });
+    fetchTodos();
+  }
+
+  async function handleDelete(id: number) {
+    await fetch(`/api/todos/${id}`, { method: 'DELETE' });
+    setTodos((prev) => prev.filter((t) => t.id !== id));
+  }
+
+  async function handleUseTemplate(templateId: number) {
+    setShowTemplateDropdown(false);
+    const res = await fetch(`/api/templates/${templateId}/use`, { method: 'POST' });
+    if (res.ok) fetchTodos();
+  }
+
+  async function handleDeleteTemplate(id: number) {
+    if (!confirm('Delete this template? This does not affect todos already created from it.')) return;
+    const res = await fetch(`/api/templates/${id}`, { method: 'DELETE' });
+    if (res.ok) setTemplates((prev) => prev.filter((t) => t.id !== id));
+  }
+
+  async function handleLogout() {
+    await fetch('/api/auth/logout', { method: 'POST' });
+    router.replace('/login');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Filtering
+  // ---------------------------------------------------------------------------
+
+  // Use debouncedSearch for filter computation to avoid O(n) on every keystroke
+  const activeFilters: FilterState = { ...filters, search: debouncedSearch };
+  const filteredTodos = applyFilters(todos, activeFilters);
+  const filtersActive = hasActiveFilters(activeFilters);
+
+  const now = new Date();
+  const { overdue, pending, completed } = sectionTodos(filteredTodos, now);
+
+  // ---------------------------------------------------------------------------
+  // Render helpers
+  // ---------------------------------------------------------------------------
+
+  function renderSection(sectionTodos: Todo[], label: string, labelClass: string) {
+    if (!sectionTodos.length) return null;
+    return (
+      <section className="mb-6">
+        <h2 className={`text-sm font-semibold uppercase tracking-wide mb-3 ${labelClass}`}>
+          {label} ({sectionTodos.length})
+        </h2>
+        <ul className="space-y-2">
+          {sectionTodos.map((todo) => (
+            <TodoItem
+              key={todo.id}
+              todo={todo}
+              tags={tags}
+              onToggle={handleToggle}
+              onEdit={setEditingTodo}
+              onDelete={handleDelete}
+              onChanged={fetchTodos}
+            />
+          ))}
+        </ul>
+      </section>
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Export / Import
+  // ---------------------------------------------------------------------------
+
+  async function handleExport() {
+    const res = await fetch('/api/todos/export');
+    if (!res.ok) return;
+    const data = await res.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `todos-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleImportClick() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const res = await fetch('/api/todos/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+      if (res.ok) fetchTodos();
+    };
+    input.click();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
+
+  return (
+    <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
+      {/* Top Nav */}
+      <nav className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 sticky top-0 z-40">
+        <div className="max-w-2xl mx-auto px-4 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <h1 className="text-xl font-bold text-gray-900 dark:text-white">✅ Todos</h1>
+            <button
+              onClick={() => router.push('/calendar')}
+              className="text-sm text-gray-600 dark:text-gray-300 hover:text-blue-600 dark:hover:text-blue-400"
+            >
+              📅 Calendar
+            </button>
+            <button
+              onClick={() => setShowTemplateManager(true)}
+              className="text-sm text-gray-600 dark:text-gray-300 hover:text-blue-600 dark:hover:text-blue-400"
+            >
+              📋 Templates
+            </button>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-sm text-gray-500 dark:text-gray-400">
+              {user?.username}
+            </span>
+            <button
+              onClick={handleLogout}
+              className="text-sm text-red-500 hover:text-red-700"
+            >
+              Logout
+            </button>
+          </div>
+        </div>
+      </nav>
+
+      <main className="max-w-2xl mx-auto px-4 py-6 space-y-6">
+        {/* Add Todo Form */}
+        <div className="bg-white dark:bg-gray-800 rounded-2xl shadow-sm border border-gray-100 dark:border-gray-700 p-5">
+          <form onSubmit={handleAddTodo} className="space-y-3">
+            <div className="flex gap-2">
+              <input
+                value={draft.title}
+                onChange={(e) => setDraft((d) => ({ ...d, title: e.target.value }))}
+                placeholder="What needs to be done?"
+                className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <button
+                type="submit"
+                className="rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-medium px-4 py-2"
+              >
+                Add
+              </button>
+            </div>
+            {addError && <p className="text-sm text-red-600 dark:text-red-400">{addError}</p>}
+
+            <div className="grid grid-cols-2 gap-2">
+              <select
+                value={draft.priority}
+                onChange={(e) => setDraft((d) => ({ ...d, priority: e.target.value as Priority }))}
+                className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm text-gray-900 dark:text-white"
+              >
+                <option value="high">🔴 High</option>
+                <option value="medium">🟡 Medium</option>
+                <option value="low">🟢 Low</option>
+              </select>
+              <input
+                type="datetime-local"
+                value={draft.due_date}
+                onChange={(e) => setDraft((d) => ({ ...d, due_date: e.target.value }))}
+                className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm text-gray-900 dark:text-white"
+              />
+            </div>
+
+            <div className="flex items-center gap-3 flex-wrap">
+              <label className="flex items-center gap-2 cursor-pointer text-sm">
+                <input
+                  type="checkbox"
+                  checked={draft.is_recurring}
+                  onChange={(e) => setDraft((d) => ({ ...d, is_recurring: e.target.checked }))}
+                  className="rounded"
+                />
+                <span className="text-gray-700 dark:text-gray-300">Repeat</span>
+              </label>
+              {draft.is_recurring && (
+                <select
+                  value={draft.recurrence_pattern ?? ''}
+                  onChange={(e) =>
+                    setDraft((d) => ({
+                      ...d,
+                      recurrence_pattern: e.target.value as RecurrencePattern | null,
+                    }))
+                  }
+                  className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1 text-sm text-gray-900 dark:text-white"
+                >
+                  <option value="">Select…</option>
+                  <option value="daily">Daily</option>
+                  <option value="weekly">Weekly</option>
+                  <option value="monthly">Monthly</option>
+                  <option value="yearly">Yearly</option>
+                </select>
+              )}
+              <select
+                value={draft.reminder_minutes ?? ''}
+                onChange={(e) =>
+                  setDraft((d) => ({
+                    ...d,
+                    reminder_minutes: e.target.value === '' ? null : Number(e.target.value),
+                  }))
+                }
+                className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1 text-sm text-gray-900 dark:text-white"
+              >
+                <option value="">No reminder</option>
+                {REMINDER_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    🔔 {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Tags row */}
+            {tags.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {tags.map((tag) => (
+                  <button
+                    key={tag.id}
+                    type="button"
+                    onClick={() =>
+                      setDraft((d) => ({
+                        ...d,
+                        tag_ids: d.tag_ids.includes(tag.id)
+                          ? d.tag_ids.filter((x) => x !== tag.id)
+                          : [...d.tag_ids, tag.id],
+                      }))
+                    }
+                    style={{
+                      backgroundColor: draft.tag_ids.includes(tag.id) ? tag.color : undefined,
+                      color: draft.tag_ids.includes(tag.id) ? '#fff' : undefined,
+                      borderColor: tag.color,
+                    }}
+                    className="rounded-full border px-2.5 py-0.5 text-xs font-medium transition-colors"
+                  >
+                    {tag.name}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Draft subtasks */}
+            <div>
+              <div className="flex flex-wrap gap-1.5 mb-1">
+                {draft.subtasks.map((s, i) => (
+                  <span
+                    key={i}
+                    className="flex items-center gap-1 rounded-full bg-gray-100 dark:bg-gray-700 px-2.5 py-0.5 text-xs text-gray-700 dark:text-gray-300"
+                  >
+                    {s.title}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDraft((d) => ({ ...d, subtasks: d.subtasks.filter((_, j) => j !== i) }))
+                      }
+                      className="text-gray-400 hover:text-red-500"
+                    >
+                      ✕
+                    </button>
+                  </span>
+                ))}
+              </div>
+              <div className="flex gap-1">
+                <input
+                  id="subtask-input"
+                  placeholder="Add subtask (press Enter)"
+                  className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      const val = (e.target as HTMLInputElement).value.trim();
+                      if (val) {
+                        setDraft((d) => ({ ...d, subtasks: [...d.subtasks, { title: val }] }));
+                        (e.target as HTMLInputElement).value = '';
+                      }
+                    }
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Template actions */}
+            <div className="flex gap-2">
+              {draft.title.trim() && (
+                <button
+                  type="button"
+                  onClick={() => setShowSaveTemplate(true)}
+                  className="text-sm text-purple-600 dark:text-purple-400 hover:underline"
+                >
+                  💾 Save as Template
+                </button>
+              )}
+              {templates.length > 0 && (
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setShowTemplateDropdown((v) => !v)}
+                    className="text-sm text-blue-600 dark:text-blue-400 hover:underline"
+                  >
+                    Use Template ▾
+                  </button>
+                  {showTemplateDropdown && (
+                    <div className="absolute left-0 top-full mt-1 z-50 w-64 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 shadow-xl">
+                      <ul className="max-h-60 overflow-y-auto py-1">
+                        {templates.map((t) => (
+                          <li key={t.id}>
+                            <button
+                              type="button"
+                              onClick={() => handleUseTemplate(t.id)}
+                              className="w-full text-left px-4 py-2 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
+                            >
+                              {t.name}
+                              {t.category && (
+                                <span className="text-gray-400 ml-1">({t.category})</span>
+                              )}
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </form>
+        </div>
+
+        {/* Filter bar */}
+        {/* Filter bar */}
+        <div className="bg-white dark:bg-gray-800 rounded-2xl border border-gray-100 dark:border-gray-700 shadow-sm p-4 space-y-3">
+          {/* Row 1: search + quick filters + advanced toggle + actions */}
+          <div className="flex flex-wrap gap-2 items-center">
+            {/* Search with clear button */}
+            <div className="relative flex-1 min-w-[180px]">
+              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none">🔍</span>
+              <input
+                type="text"
+                value={filters.search}
+                onChange={(e) => setFilters((f) => ({ ...f, search: e.target.value }))}
+                placeholder="Search todos and subtasks..."
+                aria-label="Search todos and subtasks"
+                className="w-full pl-9 pr-8 py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              {filters.search && (
+                <button
+                  onClick={() => setFilters((f) => ({ ...f, search: '' }))}
+                  aria-label="Clear search"
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+
+            {/* Priority quick filter */}
+            <select
+              value={filters.priority}
+              onChange={(e) => setFilters((f) => ({ ...f, priority: e.target.value as Priority | 'all' }))}
+              className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm text-gray-900 dark:text-white"
+            >
+              <option value="all">All Priorities</option>
+              <option value="high">High</option>
+              <option value="medium">Medium</option>
+              <option value="low">Low</option>
+            </select>
+
+            {/* Tag quick filter */}
+            {tags.length > 0 && (
+              <select
+                value={filters.tagId === 'all' ? '' : String(filters.tagId)}
+                onChange={(e) =>
+                  setFilters((f) => ({ ...f, tagId: e.target.value === '' ? 'all' : Number(e.target.value) }))
+                }
+                className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm text-gray-900 dark:text-white"
+              >
+                <option value="">All Tags</option>
+                {tags.map((tag) => (
+                  <option key={tag.id} value={tag.id}>
+                    {tag.name}
+                  </option>
+                ))}
+              </select>
+            )}
+
+            {/* Advanced toggle */}
+            <button
+              onClick={() => setAdvancedOpen((v) => !v)}
+              className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                advancedOpen
+                  ? 'bg-blue-500 text-white'
+                  : 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-200'
+              }`}
+            >
+              {advancedOpen ? '▼ Advanced' : '▶ Advanced'}
+            </button>
+
+            {/* Clear All + Save Filter — only when filters active */}
+            {filtersActive && (
+              <>
+                <button
+                  onClick={() => setFilters(DEFAULT_FILTER_STATE)}
+                  className="text-sm font-medium text-red-600 dark:text-red-400 hover:underline"
+                >
+                  Clear All
+                </button>
+                <button
+                  onClick={() => { setSavePresetError(''); setShowSavePreset(true); }}
+                  className="text-sm font-medium text-green-600 dark:text-green-400 hover:underline"
+                >
+                  💾 Save Filter
+                </button>
+              </>
+            )}
+
+            {/* Manage Tags + Export/Import on far right */}
+            <div className="ml-auto flex gap-2 flex-wrap">
+              <button
+                onClick={() => setShowManageTags(true)}
+                className="text-sm text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400"
+              >
+                + Tags
+              </button>
+              <button onClick={handleExport} className="text-sm text-gray-500 dark:text-gray-400 hover:text-blue-600">
+                ↓ Export
+              </button>
+              <button onClick={handleImportClick} className="text-sm text-gray-500 dark:text-gray-400 hover:text-blue-600">
+                ↑ Import
+              </button>
+            </div>
+          </div>
+
+          {/* Row 2: Advanced panel */}
+          {advancedOpen && (
+            <div className="flex flex-wrap gap-3 pt-1 border-t border-gray-100 dark:border-gray-700">
+              {/* Completion status */}
+              <div>
+                <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Status</label>
+                <select
+                  value={filters.completion}
+                  onChange={(e) =>
+                    setFilters((f) => ({
+                      ...f,
+                      completion: e.target.value as FilterState['completion'],
+                    }))
+                  }
+                  className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm text-gray-900 dark:text-white"
+                >
+                  <option value="all">All Todos</option>
+                  <option value="incomplete">Incomplete Only</option>
+                  <option value="completed">Completed Only</option>
+                </select>
+              </div>
+
+              {/* Due date from */}
+              <div>
+                <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Due From</label>
+                <input
+                  type="date"
+                  value={filters.dueDateFrom ?? ''}
+                  onChange={(e) =>
+                    setFilters((f) => ({ ...f, dueDateFrom: e.target.value || null }))
+                  }
+                  className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm text-gray-900 dark:text-white"
+                />
+              </div>
+
+              {/* Due date to */}
+              <div>
+                <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Due To</label>
+                <input
+                  type="date"
+                  value={filters.dueDateTo ?? ''}
+                  onChange={(e) =>
+                    setFilters((f) => ({ ...f, dueDateTo: e.target.value || null }))
+                  }
+                  className="rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm text-gray-900 dark:text-white"
+                />
+              </div>
+
+              {/* Invalid range hint */}
+              {filters.dueDateFrom && filters.dueDateTo && filters.dueDateFrom > filters.dueDateTo && (
+                <p className="self-end text-xs text-amber-600 dark:text-amber-400 pb-1">
+                  ⚠ From date is after To date
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Row 3: Saved preset pills */}
+          {presets.length > 0 && (
+            <div className="flex flex-wrap gap-2 pt-1 border-t border-gray-100 dark:border-gray-700">
+              {presets.map((preset) => (
+                <span
+                  key={preset.id}
+                  className="inline-flex items-center gap-1 rounded-full border border-gray-300 dark:border-gray-600 px-3 py-1 text-sm"
+                >
+                  <button
+                    onClick={() => setFilters({ ...DEFAULT_FILTER_STATE, ...preset.filters })}
+                    className="font-medium text-gray-700 dark:text-gray-300 hover:text-blue-600 dark:hover:text-blue-400"
+                  >
+                    {preset.name}
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (!confirm(`Delete preset "${preset.name}"?`)) return;
+                      setPresets(deletePreset(preset.id));
+                    }}
+                    aria-label={`Delete preset ${preset.name}`}
+                    className="text-gray-400 hover:text-red-500 leading-none"
+                  >
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Todo sections */}
+        {renderSection(overdue, 'Overdue', 'text-red-600 dark:text-red-400')}
+        {renderSection(pending, 'Pending', 'text-gray-600 dark:text-gray-400')}
+        {renderSection(completed, 'Completed', 'text-green-600 dark:text-green-400')}
+
+        {filteredTodos.length === 0 && (
+          <div className="text-center py-16 text-gray-400 dark:text-gray-500">
+            <p className="text-5xl mb-3">📭</p>
+            <p>No todos yet. Add one above!</p>
+                  {filteredTodos.length === 0 && (
+                    <div className="text-center py-16 text-gray-400 dark:text-gray-500">
+                      <p className="text-5xl mb-3">{todos.length === 0 ? '📭' : '🔍'}</p>
+                      <p>
+                        {todos.length === 0
+                          ? 'You have no todos yet. Add one above!'
+                          : 'No todos match your filters.'}
+                      </p>
+                      {todos.length > 0 && filtersActive && (
+                        <button
+                          onClick={() => setFilters(DEFAULT_FILTER_STATE)}
+                          className="mt-2 text-sm text-blue-600 dark:text-blue-400 hover:underline"
+                        >
+                          Clear all filters
+                                {filteredTodos.length === 0 && (
+                                  <div className="text-center py-16 text-gray-400 dark:text-gray-500">
+                                    <p className="text-5xl mb-3">{todos.length === 0 ? '📭' : '🔍'}</p>
+                                    <p>
+                                      {todos.length === 0
+                                        ? 'You have no todos yet. Add one above!'
+                                        : 'No todos match your filters.'}
+                                    </p>
+                                    {todos.length > 0 && filtersActive && (
+                                      <button
+                                        onClick={() => setFilters(DEFAULT_FILTER_STATE)}
+                                        className="mt-2 text-sm text-blue-600 dark:text-blue-400 hover:underline"
+                                      >
+                                        Clear all filters
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
+                        </button>
+                      )}
+                    </div>
+                  )}
+          </div>
+        )}
+      </main>
+
+      {/* Modals */}
+      {showSaveTemplate && (
+        <SaveTemplateModal
+          todoDraft={draft}
+          onClose={() => setShowSaveTemplate(false)}
+          onSaved={(t) => {
+            setTemplates((prev) => [t, ...prev]);
+            setShowSaveTemplate(false);
+          }}
+        />
+      )}
+
+      {showTemplateManager && (
+        <TemplateManagerModal
+          templates={templates}
+          onUse={handleUseTemplate}
+          onDelete={handleDeleteTemplate}
+          onClose={() => setShowTemplateManager(false)}
+        />
+      )}
+
+      {editingTodo && (
+        <EditTodoModal
+          todo={editingTodo}
+          tags={tags}
+          onClose={() => setEditingTodo(null)}
+          onSaved={(updated) => {
+            setTodos((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+            setEditingTodo(null);
+          }}
+        />
+      )}
+
+      {showManageTags && (
+        <ManageTagsModal
+          tags={tags}
+          onClose={() => setShowManageTags(false)}
+          onCreated={(tag) => setTags((prev) => [...prev, tag])}
+          onDeleted={(id) => setTags((prev) => prev.filter((t) => t.id !== id))}
+        />
+      )}
+
+        {/* Save Filter Preset modal */}
+        {showSavePreset && (
+          <SaveFilterPresetModal
+            filters={activeFilters}
+            tags={tags}
+            error={savePresetError}
+            onClose={() => setShowSavePreset(false)}
+            onSaved={(preset) => {
+              try {
+                setPresets(savePreset(preset));
+                setShowSavePreset(false);
+              } catch (err) {
+                setSavePresetError((err as Error).message);
+              }
+            }}
+          />
+        )}
+    </div>
+  );
+}
