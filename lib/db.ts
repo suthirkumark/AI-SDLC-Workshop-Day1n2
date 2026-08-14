@@ -172,6 +172,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_holidays_date ON holidays(date);
 CREATE INDEX IF NOT EXISTS idx_authenticators_user_id ON authenticators(user_id);
 `);
 
+function applyMigration(sql: string): void {
+  try {
+    db.exec(sql);
+  } catch {
+    // Ignore migration if column already exists.
+  }
+}
+
+applyMigration(
+  "ALTER TABLE todos ADD COLUMN is_recurring INTEGER NOT NULL DEFAULT 0"
+);
+applyMigration("ALTER TABLE todos ADD COLUMN recurrence_pattern TEXT");
+applyMigration("ALTER TABLE todos ADD COLUMN reminder_minutes INTEGER");
+applyMigration("ALTER TABLE todos ADD COLUMN last_notification_sent TEXT");
+
 const createUserStmt = db.prepare(
   "INSERT INTO users (username, created_at) VALUES (?, ?)"
 );
