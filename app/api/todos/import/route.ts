@@ -1,80 +1,87 @@
-import { NextRequest, NextResponse } from "next/server";
-import { z } from "zod";
+import { NextRequest, NextResponse } from 'next/server';
+import { getSession } from '@/lib/auth';
+import { runInTransaction, subtaskDB, tagDB, todoDB } from '@/lib/db';
+import { validateImport } from '@/lib/export-import';
+import type { Tag } from '@/lib/types';
 
-import { getSession } from "@/lib/auth";
-import { todoDB } from "@/lib/db";
-
-const importSchema = z.object({
-  version: z.literal(1),
-  exported_at: z.string(),
-  todos: z.array(
-    z.object({
-      title: z.string().min(1),
-      completed: z.boolean(),
-      due_date: z.string().nullable(),
-      priority: z.enum(["high", "medium", "low"]),
-      is_recurring: z.boolean(),
-      recurrence_pattern: z
-        .enum(["daily", "weekly", "monthly", "yearly"])
-        .nullable(),
-      reminder_minutes: z.number().int().nullable(),
-      created_at: z.string().min(1),
-      subtasks: z.array(
-        z.object({
-          title: z.string().min(1),
-          completed: z.boolean(),
-          position: z.number().int()
-        })
-      ),
-      tags: z.array(
-        z.object({
-          name: z.string().min(1),
-          color: z.string()
-        })
-      )
-    })
-  )
-});
-
-export async function POST(request: NextRequest): Promise<NextResponse> {
+export async function POST(request: NextRequest) {
   const session = await getSession();
-  if (!session) {
-    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
-  }
+  if (!session) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
 
-  const contentLength = Number.parseInt(
-    request.headers.get("content-length") ?? "0",
-    10
-  );
-  if (Number.isFinite(contentLength) && contentLength > 10 * 1024 * 1024) {
-    return NextResponse.json(
-      { error: "File too large (max 10MB)" },
-      { status: 413 }
-    );
-  }
-
-  let payload: unknown;
+  let body: unknown;
   try {
-    payload = await request.json();
+    body = await request.json();
   } catch {
-    return NextResponse.json({ error: "Invalid JSON format" }, { status: 400 });
+    return NextResponse.json({ error: 'Import file is not valid JSON' }, { status: 400 });
   }
 
-  const parsed = importSchema.safeParse(payload);
-  if (!parsed.success) {
-    return NextResponse.json(
-      { error: "Failed to import todos. Please check the file format." },
-      { status: 400 }
-    );
+  // The whole file is validated up front so nothing is written on a bad import.
+  const validation = validateImport(body);
+  if (!validation.ok) {
+    return NextResponse.json({ error: validation.error }, { status: 400 });
   }
+
+  const { userId } = session;
 
   try {
-    const result = todoDB.importAll(session.userId, parsed.data.todos);
-    return NextResponse.json({ success: true, ...result });
+    const summary = runInTransaction(() => {
+      // Tag names are matched case-insensitively, so an import reuses the
+      // user's existing tags instead of creating near-duplicates.
+      const tagCache = new Map<string, Tag>();
+      const resolveTag = (name: string, color: string): Tag => {
+        const key = name.toLowerCase();
+        const cached = tagCache.get(key);
+        if (cached) return cached;
+
+        const tag = tagDB.findByName(userId, name) ?? tagDB.create(userId, { name, color });
+        tagCache.set(key, tag);
+        return tag;
+      };
+
+      let todosCreated = 0;
+      let subtasksCreated = 0;
+      let tagsCreated = 0;
+      const existingTagIds = new Set(tagDB.findAllByUser(userId).map((t) => t.id));
+
+      for (const imported of validation.value.todos) {
+        const todo = todoDB.create(userId, {
+          title: imported.title,
+          priority: imported.priority,
+          due_date: imported.due_date,
+          is_recurring: imported.is_recurring,
+          recurrence_pattern: imported.recurrence_pattern,
+          reminder_minutes: imported.reminder_minutes,
+        });
+        todosCreated += 1;
+
+        if (imported.completed) {
+          todoDB.update(todo.id, { completed: true });
+        }
+
+        imported.subtasks.forEach((subtask, index) => {
+          const created = subtaskDB.createAt(todo.id, subtask.title, index);
+          if (subtask.completed) subtaskDB.update(created.id, { completed: true });
+          subtasksCreated += 1;
+        });
+
+        for (const tag of imported.tags) {
+          const resolved = resolveTag(tag.name, tag.color);
+          if (!existingTagIds.has(resolved.id)) {
+            existingTagIds.add(resolved.id);
+            tagsCreated += 1;
+          }
+          tagDB.attachToTodo(todo.id, resolved.id);
+        }
+      }
+
+      return { todosCreated, subtasksCreated, tagsCreated };
+    });
+
+    return NextResponse.json({ success: true, ...summary }, { status: 201 });
   } catch (error) {
-    console.error("Import failed:", error);
+    const message = error instanceof Error ? error.message : 'Unknown error';
     return NextResponse.json(
-      { error: "Failed to import todos" },
+      { error: `Import failed and was rolled back: ${message}` },
       { status: 500 }
     );
   }

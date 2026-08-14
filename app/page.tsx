@@ -1,434 +1,335 @@
-"use client";
+'use client';
 
-import Link from "next/link";
-import { useRouter } from "next/navigation";
-import {
-    ChangeEvent,
-    useCallback,
-    useEffect,
-    useMemo,
-    useRef,
-    useState
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import type { CreateTodoDto, Tag, Todo, TodoWithDetails } from '@/lib/types';
+import { applyFilters, EMPTY_FILTERS, hasActiveFilters, type FilterState } from '@/lib/filters';
+import { useNotifications } from '@/lib/hooks/useNotifications';
+import TodoForm from '@/components/todos/TodoForm';
+import TodoList from '@/components/todos/TodoList';
+import FilterBar from '@/components/todos/FilterBar';
+import ManageTagsModal from '@/components/tags/ManageTagsModal';
+import TemplatesModal, {
+  type CreateTemplatePayload,
+  type TemplateSummary,
+} from '@/components/templates/TemplatesModal';
 
-import { LogoutButton } from "@/components/LogoutButton";
-
-type Priority = "high" | "medium" | "low";
-
-interface Todo {
-  id: number;
-  title: string;
-  completed: boolean;
-  due_date: string | null;
-  priority: Priority;
-  is_recurring: boolean;
-  recurrence_pattern: "daily" | "weekly" | "monthly" | "yearly" | null;
-  reminder_minutes: number | null;
-  subtasks: Array<{
-    id: number;
-    title: string;
-    completed: boolean;
-    position: number;
-  }>;
-  tags: Array<{ id: number; name: string; color: string }>;
-}
-
-interface TodoResponse {
-  todos: Todo[];
-}
-
-interface Message {
-  type: "success" | "error";
-  text: string;
+/** Pulls the server's error message out of a failed response. */
+async function errorFrom(res: Response, fallback: string): Promise<string> {
+  try {
+    const data = await res.json();
+    return typeof data?.error === 'string' ? data.error : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 export default function Home() {
-  const router = useRouter();
-  const [todos, setTodos] = useState<Todo[]>([]);
-  const [title, setTitle] = useState("");
-  const [priority, setPriority] = useState<Priority>("medium");
-  const [dueDate, setDueDate] = useState("");
-  const [tagInput, setTagInput] = useState("");
-  const [subtaskInput, setSubtaskInput] = useState("");
-  const [message, setMessage] = useState<Message | null>(null);
+  const [todos, setTodos] = useState<TodoWithDetails[]>([]);
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [templates, setTemplates] = useState<TemplateSummary[]>([]);
+  const [filters, setFilters] = useState<FilterState>(EMPTY_FILTERS);
+  const [showManageTags, setShowManageTags] = useState(false);
+  const [showTemplates, setShowTemplates] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
-  const [importing, setImporting] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [banner, setBanner] = useState<{ kind: 'info' | 'error'; text: string } | null>(null);
 
-  const todoCount = useMemo(() => todos.length, [todos]);
+  const router = useRouter();
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const { permission, requestPermission } = useNotifications();
 
-  const loadTodos = useCallback(async (): Promise<void> => {
-    setLoading(true);
+  const fetchTodos = useCallback(async () => {
+    const res = await fetch('/api/todos');
+    if (res.ok) setTodos(await res.json());
+  }, []);
+
+  const fetchTags = useCallback(async () => {
+    const res = await fetch('/api/tags');
+    if (res.ok) setTags(await res.json());
+  }, []);
+
+  const fetchTemplates = useCallback(async () => {
+    const res = await fetch('/api/templates');
+    if (res.ok) setTemplates(await res.json());
+  }, []);
+
+  useEffect(() => {
+    const load = async () => {
+      await Promise.all([fetchTodos(), fetchTags(), fetchTemplates()]);
+      setLoading(false);
+    };
+    load();
+  }, [fetchTodos, fetchTags, fetchTemplates]);
+
+  const handleCreateTodo = async (data: CreateTodoDto, tagIds: number[]) => {
+    const res = await fetch('/api/todos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+
+    if (!res.ok) return errorFrom(res, 'Could not create the todo');
+
+    const todo: TodoWithDetails = await res.json();
+    for (const tagId of tagIds) {
+      await fetch(`/api/todos/${todo.id}/tags`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tag_id: tagId }),
+      });
+    }
+
+    await fetchTodos();
+    return null;
+  };
+
+  const handleToggleComplete = async (todo: Todo) => {
+    const res = await fetch(`/api/todos/${todo.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ completed: !todo.completed }),
+    });
+
+    if (!res.ok) {
+      setBanner({ kind: 'error', text: await errorFrom(res, 'Could not update the todo') });
+      return;
+    }
+
+    // Completing a recurring todo spawns its next instance server-side.
+    const updated = await res.json();
+    if (updated?.next_instance) {
+      setBanner({ kind: 'info', text: `Next "${todo.title}" scheduled.` });
+    }
+
+    await fetchTodos();
+  };
+
+  const handleDeleteTodo = async (id: number) => {
+    setTodos((prev) => prev.filter((t) => t.id !== id));
+    const res = await fetch(`/api/todos/${id}`, { method: 'DELETE' });
+    if (!res.ok) await fetchTodos();
+  };
+
+  const handleTagClick = (tag: Tag) => {
+    setFilters((prev) => ({ ...prev, tagId: prev.tagId === tag.id ? null : tag.id }));
+  };
+
+  const handleCreateTag = async (input: { name: string; color?: string }) => {
+    const res = await fetch('/api/tags', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (res.ok) await fetchTags();
+  };
+
+  const handleUpdateTag = async (id: number, input: { name?: string; color?: string }) => {
+    const res = await fetch(`/api/tags/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(input),
+    });
+    if (res.ok) { await fetchTags(); await fetchTodos(); }
+  };
+
+  const handleDeleteTag = async (id: number) => {
+    const res = await fetch(`/api/tags/${id}`, { method: 'DELETE' });
+    if (res.ok) {
+      setFilters((prev) => (prev.tagId === id ? { ...prev, tagId: null } : prev));
+      await fetchTags();
+      await fetchTodos();
+    }
+  };
+
+  const handleCreateTemplate = async (payload: CreateTemplatePayload) => {
+    const res = await fetch('/api/templates', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) return errorFrom(res, 'Could not save the template');
+
+    await fetchTemplates();
+    return null;
+  };
+
+  const handleUseTemplate = async (id: number) => {
+    const res = await fetch(`/api/templates/${id}/use`, { method: 'POST' });
+    if (!res.ok) return errorFrom(res, 'Could not create a todo from this template');
+
+    await fetchTodos();
+    setBanner({ kind: 'info', text: 'Todo created from template.' });
+    return null;
+  };
+
+  const handleDeleteTemplate = async (id: number) => {
+    const res = await fetch(`/api/templates/${id}`, { method: 'DELETE' });
+    if (res.ok) await fetchTemplates();
+  };
+
+  const handleImportFile = async (file: File) => {
+    setBanner(null);
+
     try {
-      const response = await fetch("/api/todos", { cache: "no-store" });
-      if (response.status === 401) {
-        router.replace("/login");
+      const parsed = JSON.parse(await file.text());
+      const res = await fetch('/api/todos/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(parsed),
+      });
+
+      if (!res.ok) {
+        setBanner({ kind: 'error', text: await errorFrom(res, 'Import failed') });
         return;
       }
 
-      if (!response.ok) {
-        throw new Error("Failed to load todos");
-      }
-
-      const data = (await response.json()) as TodoResponse;
-      setTodos(data.todos);
-    } catch (error) {
-      setMessage({
-        type: "error",
-        text: error instanceof Error ? error.message : "Failed to load todos"
+      const summary = await res.json();
+      setBanner({
+        kind: 'info',
+        text: `Imported ${summary.todosCreated} todo${summary.todosCreated !== 1 ? 's' : ''}.`,
       });
-    } finally {
-      setLoading(false);
+      await Promise.all([fetchTodos(), fetchTags()]);
+    } catch {
+      setBanner({ kind: 'error', text: 'That file is not valid JSON.' });
     }
-  }, [router]);
+  };
 
-  useEffect(() => {
-    const timeoutId = setTimeout(() => {
-      void loadTodos();
-    }, 0);
-
-    return () => clearTimeout(timeoutId);
-  }, [loadTodos]);
-
-  async function onCreateTodo(event: {
-    preventDefault: () => void;
-  }): Promise<void> {
-    event.preventDefault();
-    const normalizedTitle = title.trim();
-    if (!normalizedTitle) {
-      setMessage({ type: "error", text: "Title is required" });
-      return;
-    }
-
-    setSubmitting(true);
-    setMessage(null);
-
-    try {
-      const tags = tagInput
-        .split(",")
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0)
-        .map((name) => ({ name, color: "#0d9488" }));
-
-      const subtasks = subtaskInput
-        .split("\n")
-        .map((value) => value.trim())
-        .filter((value) => value.length > 0)
-        .map((subtaskTitle) => ({ title: subtaskTitle }));
-
-      const payload = {
-        title: normalizedTitle,
-        priority,
-        due_date: dueDate ? new Date(dueDate).toISOString() : null,
-        subtasks,
-        tags
-      };
-
-      const response = await fetch("/api/todos", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      const data = (await response.json()) as { error?: string };
-      if (!response.ok) {
-        throw new Error(data.error ?? "Failed to create todo");
-      }
-
-      setTitle("");
-      setDueDate("");
-      setTagInput("");
-      setSubtaskInput("");
-      setMessage({ type: "success", text: "Todo created" });
-      await loadTodos();
-    } catch (error) {
-      setMessage({
-        type: "error",
-        text: error instanceof Error ? error.message : "Failed to create todo"
-      });
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  async function onClearTodos(): Promise<void> {
-    setMessage(null);
-    const response = await fetch("/api/todos", { method: "DELETE" });
-    if (!response.ok) {
-      setMessage({ type: "error", text: "Failed to clear todos" });
-      return;
-    }
-
-    setMessage({ type: "success", text: "All todos removed" });
-    await loadTodos();
-  }
-
-  function download(format: "json" | "csv"): void {
-    const link = document.createElement("a");
+  /** Downloads an export. The API route sets the filename via Content-Disposition. */
+  const handleExport = (format: 'json' | 'csv') => {
+    const link = document.createElement('a');
     link.href = `/api/todos/export?format=${format}`;
     document.body.appendChild(link);
     link.click();
-    document.body.removeChild(link);
-  }
+    link.remove();
+  };
 
-  async function onImportFile(
-    event: ChangeEvent<HTMLInputElement>
-  ): Promise<void> {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST' });
+    router.push('/login');
+    router.refresh();
+  };
 
-    setImporting(true);
-    setMessage(null);
-
-    try {
-      const text = await file.text();
-      let payload: unknown;
-      try {
-        payload = JSON.parse(text);
-      } catch {
-        throw new SyntaxError("Invalid JSON format");
-      }
-
-      const response = await fetch("/api/todos/import", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-
-      const data = (await response.json()) as {
-        imported?: number;
-        error?: string;
-      };
-      if (!response.ok) {
-        throw new Error(data.error ?? "Failed to import todos");
-      }
-
-      setMessage({
-        type: "success",
-        text: `Successfully imported ${data.imported ?? 0} todos`
-      });
-      await loadTodos();
-    } catch (error) {
-      setMessage({
-        type: "error",
-        text: getImportErrorMessage(error)
-      });
-    } finally {
-      setImporting(false);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-    }
-  }
-
-  function getImportErrorMessage(error: unknown): string {
-    if (error instanceof SyntaxError) {
-      return "Invalid JSON format";
-    }
-
-    if (error instanceof Error) {
-      return error.message;
-    }
-
-    return "Failed to import todos";
-  }
+  const visibleTodos = useMemo(() => applyFilters(todos, filters), [todos, filters]);
 
   return (
-    <div className="min-h-screen bg-slate-50 px-4 py-8 text-slate-900">
-      <main className="mx-auto flex w-full max-w-5xl flex-col gap-6">
-        <header className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-          <h1 className="text-3xl font-semibold">Todo Export & Import</h1>
-          <p className="mt-2 text-sm text-slate-600">
-            Import always adds new todos and does not merge with existing data.
-          </p>
-          <div className="mt-5 flex flex-wrap gap-2">
-            <button
-              type="button"
-              onClick={() => download("json")}
-              className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-700"
-            >
-              Export JSON
-            </button>
-            <button
-              type="button"
-              onClick={() => download("csv")}
-              className="rounded-lg bg-emerald-800 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-900"
-            >
-              Export CSV
-            </button>
-            <button
-              type="button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={importing}
-              className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {importing ? "Importing..." : "Import"}
-            </button>
-            <button
-              type="button"
-              onClick={onClearTodos}
-              className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-900"
-            >
-              Clear Todos
-            </button>
-            <LogoutButton className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100" />
-            <Link
-              href="/calendar"
-              className="rounded-lg bg-purple-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-purple-700"
-            >
-              Calendar
-            </Link>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="application/json,.json"
-              className="hidden"
-              onChange={(event) => {
-                void onImportFile(event);
-              }}
-            />
-          </div>
-          {message ? (
-            <p
-              className={`mt-4 text-sm ${message.type === "success" ? "text-emerald-700" : "text-red-700"}`}
-            >
-              {message.text}
-            </p>
-          ) : null}
-        </header>
+    <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
+      <header className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+        <h1 className="text-lg font-bold text-gray-800 dark:text-white">Todo App</h1>
 
-        <section className="grid gap-6 lg:grid-cols-[2fr_3fr]">
-          <form
-            onSubmit={(event) => {
-              void onCreateTodo(event);
-            }}
-            className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"
+        <nav className="flex flex-wrap items-center gap-3 text-sm">
+          <Link href="/calendar" className="text-blue-600 dark:text-blue-400 hover:underline">
+            Calendar
+          </Link>
+          <button type="button" onClick={() => setShowTemplates(true)} className="text-blue-600 dark:text-blue-400 hover:underline">
+            Templates
+          </button>
+          <button type="button" onClick={() => setShowManageTags(true)} className="text-blue-600 dark:text-blue-400 hover:underline">
+            Manage Tags
+          </button>
+          <button type="button" onClick={() => handleExport('json')} className="text-blue-600 dark:text-blue-400 hover:underline">
+            Export JSON
+          </button>
+          <button type="button" onClick={() => handleExport('csv')} className="text-blue-600 dark:text-blue-400 hover:underline">
+            Export CSV
+          </button>
+          <button type="button" onClick={() => importInputRef.current?.click()} className="text-blue-600 dark:text-blue-400 hover:underline">
+            Import
+          </button>
+          <button type="button" onClick={handleLogout} className="text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200">
+            Sign out
+          </button>
+        </nav>
+
+        <input
+          ref={importInputRef}
+          type="file"
+          accept="application/json,.json"
+          className="hidden"
+          aria-label="Import todos from a JSON export"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) handleImportFile(file);
+            e.target.value = '';
+          }}
+        />
+      </header>
+
+      <main className="max-w-2xl mx-auto px-4 py-6 space-y-6">
+        {permission === 'default' && (
+          <button
+            type="button"
+            onClick={requestPermission}
+            className="w-full text-sm text-left rounded-lg border border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300 px-3 py-2 hover:bg-blue-100 dark:hover:bg-blue-900/40"
           >
-            <h2 className="text-xl font-semibold">Create Todo</h2>
-            <div className="mt-4 grid gap-4">
-              <label className="grid gap-1 text-sm">
-                <span>Title</span>
-                <input
-                  value={title}
-                  onChange={(event) => setTitle(event.target.value)}
-                  placeholder="Prepare project report"
-                  className="rounded-lg border border-slate-300 px-3 py-2 outline-none ring-0 focus:border-blue-500"
-                />
-              </label>
+            🔔 Enable browser notifications to get todo reminders.
+          </button>
+        )}
 
-              <label className="grid gap-1 text-sm">
-                <span>Priority</span>
-                <select
-                  value={priority}
-                  onChange={(event) =>
-                    setPriority(event.target.value as Priority)
-                  }
-                  className="rounded-lg border border-slate-300 px-3 py-2 outline-none ring-0 focus:border-blue-500"
-                >
-                  <option value="high">High</option>
-                  <option value="medium">Medium</option>
-                  <option value="low">Low</option>
-                </select>
-              </label>
+        {banner && (
+          <div
+            role="status"
+            className={`flex items-start gap-2 rounded-lg px-3 py-2 text-sm ${
+              banner.kind === 'error'
+                ? 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300'
+                : 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300'
+            }`}
+          >
+            <span className="flex-1">{banner.text}</span>
+            <button type="button" onClick={() => setBanner(null)} aria-label="Dismiss message">
+              ✕
+            </button>
+          </div>
+        )}
 
-              <label className="grid gap-1 text-sm">
-                <span>Due Date</span>
-                <input
-                  type="date"
-                  value={dueDate}
-                  onChange={(event) => setDueDate(event.target.value)}
-                  className="rounded-lg border border-slate-300 px-3 py-2 outline-none ring-0 focus:border-blue-500"
-                />
-              </label>
+        <TodoForm allTags={tags} onSubmit={handleCreateTodo} />
 
-              <label className="grid gap-1 text-sm">
-                <span>Tags (comma separated)</span>
-                <input
-                  value={tagInput}
-                  onChange={(event) => setTagInput(event.target.value)}
-                  placeholder="Work, Finance"
-                  className="rounded-lg border border-slate-300 px-3 py-2 outline-none ring-0 focus:border-blue-500"
-                />
-              </label>
+        <FilterBar
+          tags={tags}
+          filters={filters}
+          onChange={setFilters}
+          totalCount={todos.length}
+          filteredCount={visibleTodos.length}
+        />
 
-              <label className="grid gap-1 text-sm">
-                <span>Subtasks (one per line)</span>
-                <textarea
-                  value={subtaskInput}
-                  onChange={(event) => setSubtaskInput(event.target.value)}
-                  rows={4}
-                  placeholder="Draft summary\nReview by team"
-                  className="rounded-lg border border-slate-300 px-3 py-2 outline-none ring-0 focus:border-blue-500"
-                />
-              </label>
-
-              <button
-                type="submit"
-                disabled={submitting}
-                className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {submitting ? "Saving..." : "Add Todo"}
-              </button>
-            </div>
-          </form>
-
-          <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
-            <h2 className="text-xl font-semibold">Todos ({todoCount})</h2>
-            {loading ? (
-              <p className="mt-4 text-sm text-slate-500">Loading...</p>
-            ) : null}
-            {!loading && todos.length === 0 ? (
-              <p className="mt-4 text-sm text-slate-500">
-                No todos yet. Create one to test export/import.
-              </p>
-            ) : null}
-            <ul className="mt-4 space-y-3">
-              {todos.map((todo) => (
-                <li
-                  key={todo.id}
-                  className="rounded-xl border border-slate-200 p-4"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="font-medium">{todo.title}</p>
-                    <span className="rounded-md bg-slate-100 px-2 py-1 text-xs uppercase tracking-wide text-slate-700">
-                      {todo.priority}
-                    </span>
-                  </div>
-                  <p className="mt-1 text-xs text-slate-500">
-                    Due:{" "}
-                    {todo.due_date
-                      ? new Date(todo.due_date).toLocaleDateString()
-                      : "-"}
-                  </p>
-                  {todo.tags.length > 0 ? (
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      {todo.tags.map((tag) => (
-                        <span
-                          key={`${todo.id}-${tag.id}`}
-                          className="rounded-md px-2 py-1 text-xs font-medium text-white"
-                          style={{ backgroundColor: tag.color }}
-                        >
-                          {tag.name}
-                        </span>
-                      ))}
-                    </div>
-                  ) : null}
-                  {todo.subtasks.length > 0 ? (
-                    <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-slate-700">
-                      {todo.subtasks.map((subtask) => (
-                        <li key={subtask.id}>{subtask.title}</li>
-                      ))}
-                    </ul>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
-          </section>
-        </section>
+        {loading ? (
+          <p className="text-sm text-gray-400 dark:text-gray-500 text-center py-8">Loading...</p>
+        ) : (
+          <TodoList
+            todos={visibleTodos}
+            emptyMessage={
+              hasActiveFilters(filters)
+                ? 'No todos match these filters.'
+                : 'No todos yet — add one above!'
+            }
+            onToggleComplete={handleToggleComplete}
+            onDelete={handleDeleteTodo}
+            onRefresh={fetchTodos}
+            onTagClick={handleTagClick}
+          />
+        )}
       </main>
+
+      {showManageTags && (
+        <ManageTagsModal
+          tags={tags}
+          onClose={() => setShowManageTags(false)}
+          onCreate={handleCreateTag}
+          onUpdate={handleUpdateTag}
+          onDelete={handleDeleteTag}
+        />
+      )}
+
+      {showTemplates && (
+        <TemplatesModal
+          templates={templates}
+          onClose={() => setShowTemplates(false)}
+          onCreate={handleCreateTemplate}
+          onUse={handleUseTemplate}
+          onDelete={handleDeleteTemplate}
+        />
+      )}
     </div>
   );
 }

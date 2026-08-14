@@ -1,74 +1,26 @@
-import { NextRequest, NextResponse } from "next/server";
-import { z } from "zod";
+import { NextRequest, NextResponse } from 'next/server';
+import { getSession } from '@/lib/auth';
+import { todoDB } from '@/lib/db';
+import { withDetails } from '@/lib/todo-service';
+import { validateCreateTodo } from '@/lib/validation';
 
-import { getSession } from "@/lib/auth";
-import { todoDB } from "@/lib/db";
-
-const createTodoSchema = z.object({
-  title: z.string().min(1),
-  completed: z.boolean().optional(),
-  due_date: z.string().nullable().optional(),
-  priority: z.enum(["high", "medium", "low"]).optional(),
-  is_recurring: z.boolean().optional(),
-  recurrence_pattern: z
-    .enum(["daily", "weekly", "monthly", "yearly"])
-    .nullable()
-    .optional(),
-  reminder_minutes: z.number().int().nullable().optional(),
-  subtasks: z
-    .array(
-      z.object({
-        title: z.string().min(1),
-        completed: z.boolean().optional()
-      })
-    )
-    .optional(),
-  tags: z
-    .array(
-      z.object({
-        name: z.string().min(1),
-        color: z.string().optional()
-      })
-    )
-    .optional()
-});
-
-export async function GET(): Promise<NextResponse> {
+export async function GET() {
   const session = await getSession();
-  if (!session) {
-    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
-  }
+  if (!session) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
 
-  const todos = todoDB.findAllWithRelations(session.userId);
-  return NextResponse.json({ todos });
+  const todos = todoDB.findAllByUser(session.userId).map(withDetails);
+  return NextResponse.json(todos);
 }
 
-export async function POST(request: NextRequest): Promise<NextResponse> {
+export async function POST(request: NextRequest) {
   const session = await getSession();
-  if (!session) {
-    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
+  if (!session) return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+
+  const validation = validateCreateTodo(await request.json());
+  if (!validation.ok) {
+    return NextResponse.json({ error: validation.error }, { status: 400 });
   }
 
-  const payload = await request.json().catch(() => null);
-  const parsed = createTodoSchema.safeParse(payload);
-
-  if (!parsed.success) {
-    return NextResponse.json(
-      { error: "Invalid todo payload" },
-      { status: 400 }
-    );
-  }
-
-  const todo = todoDB.createTodo(session.userId, parsed.data);
-  return NextResponse.json({ todo }, { status: 201 });
-}
-
-export async function DELETE(): Promise<NextResponse> {
-  const session = await getSession();
-  if (!session) {
-    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
-  }
-
-  todoDB.clearAll(session.userId);
-  return NextResponse.json({ success: true });
+  const todo = todoDB.create(session.userId, validation.value);
+  return NextResponse.json({ ...todo, subtasks: [], tags: [] }, { status: 201 });
 }

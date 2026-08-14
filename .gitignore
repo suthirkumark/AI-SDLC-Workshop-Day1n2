@@ -23,9 +23,6 @@
 # misc
 .DS_Store
 *.pem
-todos.db
-todos.db-shm
-todos.db-wal
 
 # debug
 npm-debug.log*

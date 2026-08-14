@@ -1,13 +1,8 @@
-import { NextResponse } from "next/server";
+import { NextResponse } from 'next/server';
+import { SESSION_COOKIE } from '@/lib/auth';
 
-import { deleteSession, getSession } from "@/lib/auth";
-
-export async function POST(): Promise<NextResponse> {
-  const session = await getSession();
-  if (!session) {
-    return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
-  }
-
-  await deleteSession();
-  return NextResponse.json({ success: true });
+export async function POST() {
+  const response = NextResponse.json({ success: true });
+  response.cookies.delete(SESSION_COOKIE);
+  return response;
 }
